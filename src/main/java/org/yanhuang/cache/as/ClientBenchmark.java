@@ -3,6 +3,8 @@
  */
 package org.yanhuang.cache.as;
 
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
@@ -15,7 +17,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import com.aerospike.client.AerospikeClient;
 import com.aerospike.client.Host;
 import com.aerospike.client.Key;
-import com.aerospike.client.Record;
 import com.aerospike.client.Value;
 import com.aerospike.client.cdt.MapOperation;
 import com.aerospike.client.cdt.MapOrder;
@@ -29,6 +30,7 @@ import com.aerospike.client.policy.WritePolicy;
  * @author zhyhang
  *
  */
+@SuppressWarnings("unchecked")
 public class ClientBenchmark {
 
 	private final ClientPolicy cp = initClientPolicy();
@@ -52,7 +54,7 @@ public class ClientBenchmark {
 
 	private WritePolicy initWritePolicy() {
 		WritePolicy wp = new WritePolicy();
-		wp.expiration = 3600 * 2;
+		wp.expiration = 3600 * 24 * 30;
 		wp.maxRetries = 0;
 		wp.sleepBetweenRetries = 5;
 		wp.socketTimeout = 10;
@@ -61,49 +63,11 @@ public class ClientBenchmark {
 	}
 
 	public AtomicLong[] writeBench() {
-		AtomicLong[] stat = new AtomicLong[12];
-		Arrays.setAll(stat, i -> new AtomicLong());
-		AtomicLong keyIndex = new AtomicLong(0);
-		ExecutorService threadPool = Executors.newFixedThreadPool(parallel);
-		try (AerospikeClient client = new AerospikeClient(cp, hosts)) {
-			for (int i = 0; i < parallel; i++) {
-				threadPool.execute(() -> {
-					long index = 0;
-					while ((index = keyIndex.incrementAndGet()) <= totalKey) {
-						Key key = createKey(index);
-						Map<Value, Value> inputMap = new HashMap<>();
-						for (int j = 0; j < mapSize; j++) {
-							inputMap.put(createMapKey(j), createMapValue(System.currentTimeMillis() / 1000,
-									ThreadLocalRandom.current().nextDouble(), String.valueOf(j)));
-						}
-						long ts = System.nanoTime();
-						long diff = 0;
-						try {
-							client.operate(wp, key, MapOperation.putItems(mp, binName, inputMap));
-							diff = System.nanoTime() - ts;
-						} catch (Exception e) {
-							diff = System.nanoTime() - ts;
-							stat[10].incrementAndGet();
-							if (ThreadLocalRandom.current().nextDouble() > 0.9) {
-								e.printStackTrace();
-							}
-						}
-						stat[11].addAndGet(diff);
-						int statIndex = (int) (diff / TimeUnit.MILLISECONDS.toNanos(2));
-						if (statIndex > 9) {
-							stat[9].incrementAndGet();
-						} else {
-							stat[statIndex].incrementAndGet();
-						}
-					}
-				});
-			}
-			threadPool.shutdown();
-			threadPool.awaitTermination(24, TimeUnit.HOURS);
-		} catch (Exception e) {
-			e.printStackTrace();
-		}
-		return stat;
+		return concurrentRwAs(this::writeOperation);
+	}
+
+	public AtomicLong[] readBench() {
+		return concurrentRwAs(this::readOperation);
 	}
 
 	private Key createKey(long index) {
@@ -121,7 +85,19 @@ public class ClientBenchmark {
 		return Value.get(Long.toHexString(last).substring(8) + Long.toHexString(lscore).substring(6) + "_" + extInfo);
 	}
 
-	public AtomicLong[] readBench() {
+	private static interface AsOperation {
+		void doOperation(AerospikeClient client, WritePolicy wp, Key key, Object dealObj);
+	}
+
+	private void writeOperation(AerospikeClient client, WritePolicy wp, Key key, Object dealObj) {
+		client.operate(wp, key, MapOperation.putItems(mp, binName, (Map<Value, Value>) dealObj));
+	}
+
+	private void readOperation(AerospikeClient client, WritePolicy wp, Key key, Object dealObj) {
+		client.operate(wp, key, MapOperation.getByRankRange(binName, -20, 20, MapReturnType.KEY_VALUE));
+	}
+
+	public AtomicLong[] concurrentRwAs(AsOperation operation) {
 		AtomicLong[] stat = new AtomicLong[12];
 		Arrays.setAll(stat, i -> new AtomicLong());
 		AtomicLong keyIndex = new AtomicLong(0);
@@ -140,8 +116,7 @@ public class ClientBenchmark {
 						long ts = System.nanoTime();
 						long diff = 0;
 						try {
-							client.operate(wp, key,
-									MapOperation.getByRankRange(binName, -4, 4, MapReturnType.KEY_VALUE));
+							operation.doOperation(client, wp, key, inputMap);
 							diff = System.nanoTime() - ts;
 						} catch (Exception e) {
 							diff = System.nanoTime() - ts;
@@ -170,43 +145,19 @@ public class ClientBenchmark {
 	}
 
 	public static void main(String[] args) {
-		try (AerospikeClient client = new AerospikeClient(new ClientPolicy(), new Host("192.168.152.188", 3000))) {
-
-			Key key = new Key("ssd_180d", null, "1024thisisamockkeyforuserprofiler1024");
-
-			String binName = "user_profile";
-
-			MapPolicy mp = new MapPolicy(MapOrder.KEY_VALUE_ORDERED, MapWriteMode.UPDATE);
-
-			Map<Value, Value> inputMap = new HashMap<>();
-			inputMap.put(Value.get("daat1"), Value.get("20170909_1"));
-			inputMap.put(Value.get("daat0"), Value.get("20170909_X"));
-			inputMap.put(Value.get("daat3"), Value.get("20170909_3"));
-			inputMap.put(Value.get("daat2"), Value.get("20170909_X"));
-			inputMap.put(Value.get("daat4"), Value.get("20170909_X"));
-
-			// write map with rank
-			// client.operate(new WritePolicy(), key, MapOperation.putItems(mp, binName,
-			// inputMap));
-
-			// // get map with rank
-			Record record = client.operate(new WritePolicy(), key,
-					MapOperation.getByRankRange(binName, -4, 4, MapReturnType.KEY_VALUE));
-
-			// Record record=client.get(new Policy(), key);
-
-			record.getList(binName).forEach(System.out::println);
-
-			// Map<?, ?> map = record.getMap(binName);
-			// map.forEach((k,v)->{System.out.printf("%s=%s\n", k,v);});
-
+		if (args.length > 0 && "-r".equals(args[0])) {
+			System.out.println("readbench begin: " + Instant.now().atZone(ZoneId.systemDefault()).toString());
+			AtomicLong[] readStats = new ClientBenchmark().readBench();
+			System.out.println("readbench end: " + Instant.now().atZone(ZoneId.systemDefault()).toString());
+			outputStat(readStats);
+		} else if (args.length > 0 && "-w".equals(args[0])) {
+			System.out.println("writebench begin: " + Instant.now().atZone(ZoneId.systemDefault()).toString());
+			AtomicLong[] writeStats = new ClientBenchmark().writeBench();
+			System.out.println("writebench end: " + Instant.now().atZone(ZoneId.systemDefault()).toString());
+			outputStat(writeStats);
+		} else {
+			System.out.println("Usage:\n\t-w for write aerospike benchmark\n\t-r for read aerospike benchmark");
 		}
-	}
-
-	public static void main2(String[] args) {
-		ClientBenchmark cb = new ClientBenchmark();
-		AtomicLong[] writeStats = cb.writeBench();
-		outputStat(writeStats);
 	}
 
 	private static void outputStat(AtomicLong[] stats) {
